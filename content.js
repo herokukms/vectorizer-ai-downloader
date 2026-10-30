@@ -32,10 +32,19 @@
  *
  * EXECUTION CONTEXT
  * -----------------
- * This runs as a Chrome content script in the default ISOLATED world. Content
- * scripts share the DOM with the page but not its JavaScript globals. However,
- * built-in constructors like `Object` are shared, which is why patching
- * `Object.prototype` works. We do NOT need `"world": "MAIN"` in the manifest.
+ * This MUST run in the page's MAIN world, not in the default ISOLATED world of
+ * content scripts. Reason: `Object.prototype` is NOT shared between the two
+ * worlds. Patching it from an isolated content script has no effect on objects
+ * created by the page's own JavaScript, so the `isReady` hook would never fire.
+ *
+ * This is achieved either by:
+ *   (a) declaring `"world": "MAIN"` in the manifest's content_scripts entry
+ *       (Chrome/Edge 111+), or
+ *   (b) injecting this file as a <script> tag from a small isolated-world
+ *       injector (works on older browsers). See README for details.
+ *
+ * Because of this, the script has NO access to `chrome.*` APIs. It only needs
+ * standard DOM APIs, which is fine for its purpose.
  *
  * RUN TIMING
  * ----------
@@ -167,7 +176,16 @@
         e.preventDefault();
         e.stopPropagation();
 
-        const svgContent = buildSvgFromData();
+        let svgContent;
+        try {
+            svgContent = buildSvgFromData();
+        } catch (err) {
+            // Never let a serialization error break the page silently.
+            // Log the full error so it can be reported, and bail out.
+            console.error('[Vectorizer.AI Downloader] Failed to build SVG:', err);
+            return;
+        }
+
         const blob = new Blob([svgContent], { type: 'image/svg+xml;charset=utf-8' });
         const url = URL.createObjectURL(blob);
 
@@ -213,6 +231,12 @@
      * Shapes with fully transparent fill (alpha === 0) are skipped to avoid
      * emitting no-op paths.
      *
+     * NOTE on robustness: the site's model occasionally contains entries whose
+     * curve data is empty or malformed (observed in the wild: crashes like
+     * "Cannot read properties of undefined (reading '0')" inside curvesToD).
+     * Every call site below therefore treats an empty serialization result as
+     * "skip this entry" rather than assuming it always produces valid output.
+     *
      * @returns {string} A complete SVG document as a string.
      */
     function buildSvgFromData() {
@@ -223,16 +247,28 @@
          * Emit the stroke-interface paths for a list of "gap filler" objects.
          * Each interface is drawn as a non-scaling 2px stroke using the
          * interface's ARGB color (alpha packed in the top byte).
+         *
+         * Entries whose curve data is empty/invalid are skipped. This is the
+         * most common source of the "undefined reading '0'" crash because the
+         * model sometimes contains placeholder interfaces with no curves.
+         *
          * @param {Array<{shouldDraw: () => boolean, argbInt: number, curves: Array}>} list
          */
         const strokeInterfaces = (list) => {
+            if (!Array.isArray(list)) return;
             for (const i of list) {
-                if (!i.shouldDraw()) continue;
+                // `shouldDraw` is a method on the site's interface objects.
+                // Skip anything that cannot be queried.
+                if (typeof i.shouldDraw !== 'function' || !i.shouldDraw()) continue;
+
+                const d = curvesToD(i.curves);
+                if (!d) continue; // Empty/invalid curve data -> nothing to draw.
+
                 // ARGB int -> 6-digit hex (drop alpha byte) + normalized alpha.
                 const hex = '#' + (i.argbInt & 0xffffff).toString(16).padStart(6, '0');
                 const alpha = (i.argbInt >>> 24) / 255;
                 out.push(
-                    `<path d="${curvesToD(i.curves)}" fill="none" ` +
+                    `<path d="${d}" fill="none" ` +
                     `${paint('stroke', hex, alpha)} vector-effect="non-scaling-stroke"/>`
                 );
             }
@@ -241,22 +277,44 @@
         // 1. Top-level gap fillers. `topVectorShapes[i].vectorLoops[0]` holds the
         //    outer loop of each top shape, and its `vectorInterfacesToDraw` list
         //    contains the gap fillers for that region.
-        for (const top of vi.topVectorShapes) {
-            strokeInterfaces(top.vectorLoops[0].vectorInterfacesToDraw);
+        //    Guard against missing `vectorLoops` on malformed entries.
+        for (const top of vi.topVectorShapes || []) {
+            const outer = top.vectorLoops && top.vectorLoops[0];
+            if (outer) strokeInterfaces(outer.vectorInterfacesToDraw);
         }
 
         // 2. Per-shape fills and inner gap fillers.
-        for (const shape of vi.vectorShapes) {
-            const color = vi.userPalette.getMutRgba(shape.paletteIndex);
+        for (const shape of vi.vectorShapes || []) {
+            // Skip malformed shapes lacking the palette index or loop lists.
+            if (shape.paletteIndex === undefined) continue;
+
+            let color;
+            try {
+                color = vi.userPalette.getMutRgba(shape.paletteIndex);
+            } catch (err) {
+                // Defensive: an out-of-range palette index should not abort
+                // the whole export. Log and skip this shape only.
+                console.warn(
+                    `[Vectorizer.AI Downloader] Skipping shape with invalid palette index ` +
+                    `${shape.paletteIndex}:`, err
+                );
+                continue;
+            }
 
             // Skip shapes with fully transparent fill (nothing to draw).
             if (color.a !== 0) {
                 // Combine all drawable outer loops into one `<path>`. Each loop
                 // is closed with ' Z' so non-zero/even-odd fill rules behave
-                // the same as the site's canvas fill.
-                const d = shape.vectorLoopsToDraw
-                    .map((loop) => curvesToD(loop.curveLoop.curves) + ' Z')
+                // the same as the site's canvas fill. Empty loops are dropped
+                // by the filter so we never emit dangling whitespace or 'Z'.
+                const d = (shape.vectorLoopsToDraw || [])
+                    .map((loop) => {
+                        const path = curvesToD(loop && loop.curveLoop && loop.curveLoop.curves);
+                        return path ? path + ' Z' : '';
+                    })
+                    .filter(Boolean)
                     .join(' ');
+
                 if (d) {
                     out.push(`<path d="${d}" ${paint('fill', color.toCssRgbHex(), color.a)}/>`);
                 }
@@ -264,8 +322,8 @@
 
             // Inner loop gap fillers: loop.index === 0 is the outer boundary
             // (already handled by the fill), so we skip it here.
-            for (const loop of shape.vectorLoops) {
-                if (loop.index !== 0) {
+            for (const loop of shape.vectorLoops || []) {
+                if (loop && loop.index !== 0) {
                     strokeInterfaces(loop.vectorInterfacesToDraw);
                 }
             }
@@ -327,21 +385,35 @@
      *   - Circular arc  : has `radius`         -> "A" (rotation = 0)
      *   - Line          : fallback             -> "L"
      *
+     * Robustness: the site's model sometimes contains empty or malformed
+     * curve arrays (observed in the wild). This function returns an empty
+     * string in that case, and all callers are expected to skip empty
+     * results rather than assume valid output.
+     *
      * NOTE on full circles: a single 2π arc is degenerate in SVG (start == end
      * causes the renderer to skip it). The site pre-splits circles into halves
      * before emitting them, so we do not see 2π arcs in practice (0 observed
      * during testing). If one ever appears, add a two-half split here.
      *
      * @param {Array<object>} curves
-     * @returns {string}
+     * @returns {string} Path data, or '' if the input is empty/invalid.
      */
     function curvesToD(curves) {
+        // Guard: empty or missing curve arrays have been observed in real
+        // vectorizer.ai models. Returning '' lets callers skip the entry.
+        if (!Array.isArray(curves) || curves.length === 0) return '';
+
+        const first = curves[0];
+        // A curve list with no start point is unusable. Bail out cleanly.
+        if (!first || first.startX === undefined || first.startY === undefined) return '';
+
         // Every curve list is a connected polybezier; the first point starts
         // the path, and each subsequent curve ends where the next begins.
-        const first = curves[0];
         const head = `M ${F(first.startX)} ${F(first.startY)} `;
 
         const segments = curves.map((c) => {
+            // Defensive: skip malformed curve entries that lack an endpoint.
+            if (!c || c.endX === undefined || c.endY === undefined) return '';
             const end = `${F(c.endX)} ${F(c.endY)}`;
 
             if ('controlStartX' in c) {
@@ -370,7 +442,11 @@
             }
             // Straight line.
             return `L ${end}`;
-        });
+        }).filter(Boolean); // Drop malformed segments.
+
+        // If every segment was dropped, the path is just a lone "M x y",
+        // which is not a valid visible path. Treat it as empty.
+        if (segments.length === 0) return '';
 
         return head + segments.join(' ');
     }

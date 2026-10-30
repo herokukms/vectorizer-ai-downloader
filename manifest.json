@@ -5,9 +5,10 @@
   "description": "Reads the vector result straight from vectorizer.ai's in-page model and downloads it as a full SVG.",
   "content_scripts": [
     {
-      "matches": ["https://vectorizer.ai/images/*"],
+      "matches": ["https://vectorizer.ai/*"],
       "js": ["content.js"],
-      "run_at": "document_start"
+      "run_at": "document_start",
+      "world": "MAIN"
     }
   ]
 }
