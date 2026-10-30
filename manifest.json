@@ -1,0 +1,13 @@
+{
+  "manifest_version": 3,
+  "name": "Vectorizer.AI Downloader",
+  "version": "0.1.0",
+  "description": "Reads the vector result straight from vectorizer.ai's in-page model and downloads it as a full SVG.",
+  "content_scripts": [
+    {
+      "matches": ["https://vectorizer.ai/images/*"],
+      "js": ["content.js"],
+      "run_at": "document_start"
+    }
+  ]
+}
